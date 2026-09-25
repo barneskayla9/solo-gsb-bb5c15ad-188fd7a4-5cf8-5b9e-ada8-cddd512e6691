@@ -14,6 +14,7 @@
 - 支持 `POST /locate-quote`：复用校时输入和逐字时间轴，在修订文本中全局选择互不重叠的近似引语命中。
 - 支持 `POST /revision-diff`：复用校时输入与同一对齐结果，输出人工修订相对识别稿的有序改动块（insert/delete/replace）。
 - 支持 `POST /captions`：复用校时输入和逐字时间轴，按字符数/时长上限把修订文本切成字幕段。
+- 支持 `POST /speaker-turns`：复用校时输入和逐字时间轴，把每个修订字符按时间重叠归属到说话人轮次，再合并成带 `speaker_id` 的文本块。
 - 支持 `POST /retime`：在 `/align` 的逐字时间轴上，按 1～20 个校准点做分段线性重映射，校正整体语速偏差。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
@@ -26,15 +27,17 @@
 docker compose up --build -d
 ```
 
-启动后（首次会构建镜像并在**容器启动时安装 Python 依赖**）：
+启动后（首次会构建镜像并在**容器启动时安装 Python 依赖**），API 监听
+宿主机 **8000** 端口（`docker-compose.yml` 中 `"8000:8000"`，左侧可改）：
 
-- API 地址：`http://localhost:8000`
+- API 地址（基地址）：`http://localhost:8000`
 - 健康检查：`GET http://localhost:8000/health`
 - 校时接口：`POST http://localhost:8000/align`
 - 校准重映射接口：`POST http://localhost:8000/retime`
 - 引语定位接口：`POST http://localhost:8000/locate-quote`
 - 修订差异接口：`POST http://localhost:8000/revision-diff`
 - 字幕切分接口：`POST http://localhost:8000/captions`
+- 说话人轮次接口：`POST http://localhost:8000/speaker-turns`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -392,6 +395,71 @@ curl -X POST http://localhost:8000/captions \
 - `text` 为该段文字；`start` / `end` 分别取首字符时间轴的 `start` 与末字符的 `end`。
 - `revised_text` 为空时返回 `[]`。
 
+### `POST /speaker-turns`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，把每个修订字符按其逐字时间轴
+**归属到一个说话人轮次**，再把相邻且归属相同的字符合并成块。
+
+请求体包含 `/align` 的全部字段，另加 `speaker_turns`（说话人轮次数组）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `speaker_turns` | 数组 | 按起始时间排序、互不重叠的说话人轮次；允许为空数组 `[]` |
+| `speaker_turns[].speaker_id` | 字符串 | 说话人标识，**非空** |
+| `speaker_turns[].start` | 整数 | 轮次起始毫秒，`>= 0`（左闭，含该时点） |
+| `speaker_turns[].end` | 整数 | 轮次结束毫秒，`>= start`（右开，不含该时点），不超过 `total_duration` |
+
+归属规则：
+
+1. 每个修订字符归属到与其时间区间 `[start, end)` **重叠时长最大**的轮次；
+   重叠时长并列时取**较早**的轮次；与所有轮次均无重叠时归属为 `null`（保留在结果中）。
+2. **零时长字符**（`start == end`）按其所在时点归属（时点含于轮次左闭右开区间）；
+   时点恰好落在两轮次边界时归**右侧**轮次。
+3. 把**相邻且 `speaker_id` 相同**（含同为 `null`）的字符合并为一个块；
+   同一 `speaker_id` 的轮次若不相邻（中间隔着其他说话人），块不跨轮次合并。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/speaker-turns \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":400,"end":500},
+      {"char":"界","start":600,"end":700}
+    ],
+    "total_duration": 1000,
+    "revised_text": "你好世界",
+    "speaker_turns": [
+      {"speaker_id":"alice","start":0,"end":350},
+      {"speaker_id":"bob","start":350,"end":1000}
+    ]
+  }'
+```
+
+响应：
+
+```json
+[
+  {"speaker_id":"alice","start_index":0,"end_index":2,"text":"你好","start":0,"end":300},
+  {"speaker_id":"bob","start_index":2,"end_index":4,"text":"世界","start":400,"end":700}
+]
+```
+
+字段说明：
+
+- `speaker_id`：该块归属的说话人；无任何轮次与块内字符时间区间重叠时为 `null`。
+- `start_index` / `end_index`：块在 `revised_text` 中的字符下标，`end_index` 为
+  半开区间（不含）；`text` 为块内修订文本原文。
+- `start` / `end`：块首字符时间轴的 `start` 与块末字符时间轴的 `end`（毫秒）。
+- `revised_text` 为空或无字符可归属时返回 `[]`。
+
+轮次非法（负时间、`end < start`、超出 `total_duration`、未按 `start` 排序、
+相邻轮次重叠）返回 **422**；前一轮 `end` 与后一轮 `start` 相等（半开区间相切）
+不算重叠，合法。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -404,7 +472,8 @@ curl -X POST http://localhost:8000/captions \
 识别字符多于/少于 1 个、字段缺失或类型错误、超出规模上限、`quote` 为空或超长、
 `max_edits` 不在 0～2、`max_chars` 不在 1～80、`max_duration_ms` 不在 500～30000、
 单字跨度超过 `max_duration_ms`，以及 `/retime` 校准点数量不在 1～20、
-`at_ms`/`corrected_ms` 未严格递增或落在开区间 `(0, total_duration)` 之外等。
+`at_ms`/`corrected_ms` 未严格递增或落在开区间 `(0, total_duration)` 之外，
+`/speaker-turns` 的 `speaker_id` 为空、轮次负时间/起止倒置/越界/乱序/重叠等。
 
 ---
 
@@ -457,6 +526,7 @@ app/
   revision.py        修订差异：以未改动匹配字符为边界合并有序改动块
   retime.py          校准点校验与分段线性重映射（旧时间 → 新时间）
   captions.py        字幕切分（段数最少 → 断点总分最高 → 字典序最小）
+  speaker.py         说话人轮次：轮次校验、按重叠时长逐字归属、相邻同归属字符合并
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码

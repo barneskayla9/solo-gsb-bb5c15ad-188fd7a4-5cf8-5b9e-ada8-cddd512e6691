@@ -72,6 +72,25 @@ class CaptionsRequest(AlignRequest):
     )
 
 
+class SpeakerTurn(BaseModel):
+    """单个说话人轮次：毫秒时间上的半开区间 [start, end)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    speaker_id: str = Field(..., min_length=1, description="说话人标识，非空字符串")
+    start: StrictInt = Field(..., description="轮次起始时间（毫秒，含该时点）")
+    end: StrictInt = Field(..., description="轮次结束时间（毫秒，不含该时点）")
+
+
+class SpeakerTurnsRequest(AlignRequest):
+    """校时输入与按时间排序、互不重叠的说话人轮次。"""
+
+    speaker_turns: list[SpeakerTurn] = Field(
+        ...,
+        description="按起始时间排序、互不重叠的说话人轮次（毫秒，左闭右开）",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -133,6 +152,18 @@ class RevisionBlock(BaseModel):
         ..., description="块起始毫秒：涉及识别字符与修订时间轴字符的最早 start")
     end: int = Field(
         ..., description="块结束毫秒：涉及识别字符与修订时间轴字符的最晚 end")
+
+
+class SpeakerBlock(BaseModel):
+    speaker_id: str | None = Field(
+        ..., description="归属说话人标识；无任何轮次与字符时间区间重叠时为 null")
+    start_index: int = Field(
+        ..., description="块首字符在修订文本中的下标（从 0 开始）")
+    end_index: int = Field(
+        ..., description="块末字符下标（半开区间，不含该位置）")
+    text: str = Field(..., description="该块的修订文本原文")
+    start: int = Field(..., description="块起始毫秒，取首字符时间轴的 start")
+    end: int = Field(..., description="块结束毫秒，取末字符时间轴的 end")
 
 
 class HealthResponse(BaseModel):

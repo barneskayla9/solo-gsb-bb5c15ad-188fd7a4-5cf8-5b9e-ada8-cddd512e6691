@@ -20,10 +20,13 @@ from .schemas import (
     QuoteHit,
     RetimeRequest,
     RevisionBlock,
+    SpeakerBlock,
+    SpeakerTurnsRequest,
 )
 from .quote import find_quote_hits
 from .retime import apply_calibrations, validate_calibrations
 from .revision import build_revision_diff
+from .speaker import build_speaker_blocks, validate_speaker_turns
 from .timeline import build_timeline, validate_request
 
 
@@ -175,3 +178,17 @@ async def captions(req: CaptionsRequest) -> list[CaptionSegment]:
     timeline = build_timeline(req, alignment.backend_name())
     return build_captions(
         req.revised_text, timeline["chars"], req.max_chars, req.max_duration_ms)
+
+
+@app.post(
+    "/speaker-turns",
+    response_model=list[SpeakerBlock],
+    tags=["说话人归属"],
+)
+async def speaker_turns(req: SpeakerTurnsRequest) -> list[SpeakerBlock]:
+    """把逐字时间轴按重叠时长归属到说话人轮次，再合并相邻同归属字符为块。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    validate_speaker_turns(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_speaker_blocks(
+        req.revised_text, timeline["chars"], req.speaker_turns)

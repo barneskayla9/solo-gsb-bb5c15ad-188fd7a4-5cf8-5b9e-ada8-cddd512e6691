@@ -957,3 +957,202 @@ def test_retime_calibration_point_wrong_type(client):
         "calibrations": [{"at_ms": "50", "corrected_ms": 60}]})
     assert r.status_code == 422
     assert "整数毫秒" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 说话人轮次归属 POST /speaker-turns
+# ---------------------------------------------------------------------------
+def _turn(speaker_id, start, end):
+    return {"speaker_id": speaker_id, "start": start, "end": end}
+
+
+def _speaker_turns(client, items, revised, turns, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "speaker_turns": turns,
+    }
+    return client.post("/speaker-turns", json=payload)
+
+
+def test_speaker_turns_merge_adjacent_chars_into_blocks(client):
+    r = _speaker_turns(client, [
+        ("你", 0, 100), ("好", 200, 300), ("世", 400, 500), ("界", 600, 700),
+    ], "你好世界", [_turn("A", 0, 350), _turn("B", 350, 1000)])
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": "A", "start_index": 0, "end_index": 2,
+         "text": "你好", "start": 0, "end": 300},
+        {"speaker_id": "B", "start_index": 2, "end_index": 4,
+         "text": "世界", "start": 400, "end": 700},
+    ]
+
+
+def test_speaker_turns_choose_max_overlap_and_tie_earlier(client):
+    # “中”[100,300] 与 A 重叠 100、与 B 重叠 100，并列取较早的 A
+    r = _speaker_turns(client, [("中", 100, 300)], "中", [
+        _turn("A", 0, 200), _turn("B", 200, 400)], total=400)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "speaker_id": "A", "start_index": 0, "end_index": 1,
+        "text": "中", "start": 100, "end": 300}]
+
+    # 与 A 重叠 50、与 B 重叠 150，取重叠时长更大的 B
+    r = _speaker_turns(client, [("中", 100, 300)], "中", [
+        _turn("A", 0, 150), _turn("B", 150, 400)], total=400)
+    assert r.json()[0]["speaker_id"] == "B"
+
+
+def test_speaker_turns_zero_duration_char_uses_point_and_boundary_right(client):
+    # b 为零时长字符，时点 300 恰为 A、B 边界，半开区间下归右侧 B
+    r = _speaker_turns(client, [
+        ("a", 100, 200), ("b", 300, 300), ("c", 400, 500),
+    ], "abc", [_turn("A", 0, 300), _turn("B", 300, 600)], total=600)
+    assert r.status_code == 200, r.text
+    assert [b["speaker_id"] for b in r.json()] == ["A", "B"]
+    assert r.json()[1] == {
+        "speaker_id": "B", "start_index": 1, "end_index": 3,
+        "text": "bc", "start": 300, "end": 500}
+
+    # 零时长字符落在总时长边界：轮次在该点结束（右开）→ 无归属 null
+    r = _speaker_turns(client, [("尾", 600, 600)], "尾", [
+        _turn("A", 0, 600)], total=600)
+    assert r.json() == [{
+        "speaker_id": None, "start_index": 0, "end_index": 1,
+        "text": "尾", "start": 600, "end": 600}]
+
+    # 零时长字符落在时点 0，轮次 [0,..) 左闭包含该点 → A
+    r = _speaker_turns(client, [("首", 0, 0)], "首", [
+        _turn("A", 0, 600)], total=600)
+    assert r.json()[0]["speaker_id"] == "A"
+
+
+def test_speaker_turns_unattached_chars_kept_as_null_blocks(client):
+    # b[200,300] 落在两轮次空档中，无任何重叠 → null 块保留
+    r = _speaker_turns(client, [
+        ("a", 0, 100), ("b", 200, 300), ("c", 400, 500),
+    ], "abc", [_turn("A", 0, 150), _turn("B", 450, 600)], total=600)
+    assert r.status_code == 200, r.text
+    assert [b["speaker_id"] for b in r.json()] == ["A", None, "B"]
+    assert r.json()[1] == {
+        "speaker_id": None, "start_index": 1, "end_index": 2,
+        "text": "b", "start": 200, "end": 300}
+
+
+def test_speaker_turns_same_speaker_non_adjacent_turns_stay_separate(client):
+    # A-B-A 交替：不相邻的两个 A 轮次中间隔着 B，块不合并
+    r = _speaker_turns(client, [
+        ("a", 0, 100), ("b", 200, 300), ("c", 400, 500),
+    ], "abc", [
+        _turn("A", 0, 150), _turn("B", 150, 350), _turn("A", 350, 600),
+    ], total=600)
+    assert [b["speaker_id"] for b in r.json()] == ["A", "B", "A"]
+    assert [b["text"] for b in r.json()] == ["a", "b", "c"]
+
+
+def test_speaker_turns_empty_turns_all_null(client):
+    r = _speaker_turns(client, [("a", 0, 100), ("b", 200, 300)], "ab", [])
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": None, "start_index": 0, "end_index": 2,
+         "text": "ab", "start": 0, "end": 300}]
+
+
+def test_speaker_turns_empty_revised_text(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "", [_turn("A", 0, 200)],
+                       total=200)
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+
+def test_speaker_turns_uses_computed_timeline_for_inserted_chars(client):
+    # “呀”为新增字符，推算 [300,400]，恰好落在 B 轮次 [350,..) 一侧：
+    # 与 A[0,350) 重叠 50、与 B[350,1000) 重叠 50，并列取较早 A
+    r = _speaker_turns(client, [
+        ("你", 0, 100), ("好", 200, 300), ("世", 400, 500), ("界", 600, 700),
+    ], "你好呀世界", [_turn("A", 0, 350), _turn("B", 350, 1000)])
+    assert r.status_code == 200, r.text
+    assert [(b["text"], b["speaker_id"]) for b in r.json()] == [
+        ("你好呀", "A"), ("世界", "B")]
+
+
+def test_speaker_turns_reuses_alignment_validation(client):
+    r = _speaker_turns(client, [("a", 300, 100)], "a", [_turn("A", 0, 500)],
+                       total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_speaker_turns_not_sorted_rejected(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "a", [
+        _turn("B", 200, 300), _turn("A", 0, 100)], total=500)
+    assert r.status_code == 422
+    assert "排序" in r.json()["detail"]
+
+
+def test_speaker_turns_overlap_rejected(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "a", [
+        _turn("A", 0, 300), _turn("B", 200, 400)], total=500)
+    assert r.status_code == 422
+    assert "不得重叠" in r.json()["detail"]
+
+
+def test_speaker_turns_touching_at_boundary_allowed(client):
+    # 半开区间：前一轮 end 等于后一轮 start 不算重叠
+    r = _speaker_turns(client, [("a", 0, 100), ("b", 200, 300)], "ab", [
+        _turn("A", 0, 150), _turn("B", 150, 400)], total=400)
+    assert r.status_code == 200, r.text
+
+
+def test_speaker_turns_end_before_start_rejected(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "a", [
+        _turn("A", 400, 300)], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_speaker_turns_negative_timestamp_rejected(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "a", [
+        _turn("A", -1, 100)], total=500)
+    assert r.status_code == 422
+    assert "负数" in r.json()["detail"]
+
+
+def test_speaker_turns_out_of_recording_range_rejected(client):
+    for bad_turn in (_turn("A", 0, 501), _turn("A", 501, 600)):
+        r = _speaker_turns(client, [("a", 0, 100)], "a", [bad_turn],
+                           total=500)
+        assert r.status_code == 422
+        assert "超出录音总时长" in r.json()["detail"]
+
+
+def test_speaker_turns_empty_speaker_id_rejected(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "a", [
+        {"speaker_id": "", "start": 0, "end": 200}], total=500)
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_speaker_turns_missing_field_rejected(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 100, "revised_text": "a"})
+    assert r.status_code == 422
+    assert "speaker_turns" in r.json()["detail"]
+
+
+def test_speaker_turns_wrong_type_timestamp_rejected(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 500, "revised_text": "a",
+        "speaker_turns": [{"speaker_id": "A", "start": "0", "end": 100}]})
+    assert r.status_code == 422
+    assert "整数毫秒" in r.json()["detail"]
+
+
+def test_speaker_turns_extra_field_rejected(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 100, "revised_text": "a",
+        "speaker_turns": [{"speaker_id": "A", "start": 0, "end": 50,
+                           "bogus": 1}]})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
