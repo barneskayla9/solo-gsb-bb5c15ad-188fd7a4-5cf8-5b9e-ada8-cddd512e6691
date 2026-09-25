@@ -14,6 +14,7 @@
 - 支持 `POST /locate-quote`：复用校时输入和逐字时间轴，在修订文本中全局选择互不重叠的近似引语命中。
 - 支持 `POST /revision-diff`：复用校时输入与同一对齐结果，输出人工修订相对识别稿的有序改动块（insert/delete/replace）。
 - 支持 `POST /captions`：复用校时输入和逐字时间轴，按字符数/时长上限把修订文本切成字幕段。
+- 支持 `POST /speaker-turns`：复用校时输入与逐字时间轴，按重叠时长把每个修订字符归属到说话人轮次并合并成块。
 - 支持 `POST /retime`：在 `/align` 的逐字时间轴上，按 1～20 个校准点做分段线性重映射，校正整体语速偏差。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
@@ -35,6 +36,7 @@ docker compose up --build -d
 - 引语定位接口：`POST http://localhost:8000/locate-quote`
 - 修订差异接口：`POST http://localhost:8000/revision-diff`
 - 字幕切分接口：`POST http://localhost:8000/captions`
+- 说话人轮次归属接口：`POST http://localhost:8000/speaker-turns`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -392,6 +394,74 @@ curl -X POST http://localhost:8000/captions \
 - `text` 为该段文字；`start` / `end` 分别取首字符时间轴的 `start` 与末字符的 `end`。
 - `revised_text` 为空时返回 `[]`。
 
+### `POST /speaker-turns`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，按一组**按时间排序、互不重叠
+的说话人轮次**把每个修订字符归属到说话人，并把**相邻且归属相同**的字符合并成块。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `speaker_turns` | 数组 | 说话人轮次序列；元素为 `{"speaker_id","start","end"}`，允许为空数组 |
+| `speaker_turns[].speaker_id` | 字符串 | **非空**说话人标识 |
+| `speaker_turns[].start` | 整数 | 轮次起始毫秒（含该时点） |
+| `speaker_turns[].end` | 整数 | 轮次结束毫秒（**不含**该时点），`end >= start` |
+
+轮次为毫秒时间轴上的**左闭右开区间** `[start, end)`，必须：
+
+- 起止时间非负、`end >= start`（允许零时长轮次）、不超出 `total_duration`；
+- 按 `start` 非递减排序；
+- 互不重叠——**端点相接合法**（上一轮次 `end` 等于下一轮次 `start` 不算重叠）；
+- 任一不满足均返回 **422** 中文原因。
+
+字符归属规则：
+
+1. **正时长字符** `[start, end)`：与各轮次取左闭右开交集，归属**重叠毫秒数最大**
+   的轮次；重叠时长并列时取**较早**的轮次；与所有轮次都不重叠则不归属（`null`）。
+2. **零时长字符**（`start == end`）：按**所在时点**归属——时点位于某轮次区间内部
+   归该轮次；恰好落在两轮次相接边界时归**右侧**轮次；落在间隙则不归属。
+3. 把**相邻且 `speaker_id` 相同**的字符合并为块（相邻轮次共用同一 `speaker_id`
+   时也会合并；同为未归属 `null` 的相邻字符同样合并为未归属块）。
+
+每块返回：`speaker_id`（未归属为 `null`）、块在修订文本中的**半开下标**
+`start_index` / `end_index`、块的修订文本 `text`、首尾毫秒 `start` / `end`
+（首字符时间轴的 `start`、末字符时间轴的 `end`）。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/speaker-turns \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":500,"end":600},
+      {"char":"界","start":700,"end":800}
+    ],
+    "total_duration": 1000,
+    "revised_text": "你好呀世界",
+    "speaker_turns": [
+      {"speaker_id":"主持人","start":0,"end":250},
+      {"speaker_id":"嘉宾","start":250,"end":1000}
+    ]
+  }'
+```
+
+响应：
+
+```json
+[
+  {"speaker_id":"主持人","start_index":0,"end_index":2,"text":"你好","start":0,"end":300},
+  {"speaker_id":"嘉宾","start_index":2,"end_index":5,"text":"呀世界","start":300,"end":800}
+]
+```
+
+说明：新增字符“呀”的推算区间为 `[300,400)`，整体落在嘉宾轮次；“好”的区间
+`[200,300)` 与两轮次各重叠 50 毫秒，并列时取较早的主持人；块时间取块内首字符的
+`start` 与末字符的 `end`，因此“你好”块为 `[0,300]`（跨轮次边界不影响合并）。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -404,7 +474,9 @@ curl -X POST http://localhost:8000/captions \
 识别字符多于/少于 1 个、字段缺失或类型错误、超出规模上限、`quote` 为空或超长、
 `max_edits` 不在 0～2、`max_chars` 不在 1～80、`max_duration_ms` 不在 500～30000、
 单字跨度超过 `max_duration_ms`，以及 `/retime` 校准点数量不在 1～20、
-`at_ms`/`corrected_ms` 未严格递增或落在开区间 `(0, total_duration)` 之外等。
+`at_ms`/`corrected_ms` 未严格递增或落在开区间 `(0, total_duration)` 之外、
+`/speaker-turns` 的 `speaker_id` 为空或轮次为负时间、起止倒置、越界、
+未按起始时间排序或区间重叠等。
 
 ---
 
@@ -457,6 +529,7 @@ app/
   revision.py        修订差异：以未改动匹配字符为边界合并有序改动块
   retime.py          校准点校验与分段线性重映射（旧时间 → 新时间）
   captions.py        字幕切分（段数最少 → 断点总分最高 → 字典序最小）
+  speaker.py         说话人轮次归属（按重叠时长最大 → 较早轮次）与相邻同归属合并
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码

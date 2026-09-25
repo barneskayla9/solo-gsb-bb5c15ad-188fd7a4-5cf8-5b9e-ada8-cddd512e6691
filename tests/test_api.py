@@ -957,3 +957,228 @@ def test_retime_calibration_point_wrong_type(client):
         "calibrations": [{"at_ms": "50", "corrected_ms": 60}]})
     assert r.status_code == 422
     assert "整数毫秒" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 说话人轮次归属 POST /speaker-turns
+# ---------------------------------------------------------------------------
+def _speaker_turns(client, items, revised, turns, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "speaker_turns": turns,
+    }
+    return client.post("/speaker-turns", json=payload)
+
+
+def _turn(speaker, start, end):
+    return {"speaker_id": speaker, "start": start, "end": end}
+
+
+def test_speaker_turns_assign_by_max_overlap_and_merge(client):
+    # 你[0,100] 好[200,300] 呀(computed)[300,400] 世[500,600] 界[700,800]
+    # 轮次 A[0,250)、B[250,1000)：好与 A 重叠 50、与 B 重叠 50 → 并列取较早 A
+    r = _speaker_turns(client, [
+        ("你", 0, 100), ("好", 200, 300), ("世", 500, 600), ("界", 700, 800),
+    ], "你好呀世界", [_turn("A", 0, 250), _turn("B", 250, 1000)])
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": "A", "start_index": 0, "end_index": 2,
+         "text": "你好", "start": 0, "end": 300},
+        {"speaker_id": "B", "start_index": 2, "end_index": 5,
+         "text": "呀世界", "start": 300, "end": 800},
+    ]
+
+
+def test_speaker_turns_boundary_goes_to_right_turn(client):
+    # 字符正好覆盖到边界 300：a[0,300) 与左右两轮次各重叠 300，并列取较早；
+    # 而零时长字符落在边界 300 上时归右侧轮次。
+    r = _speaker_turns(client, [
+        ("a", 0, 300), ("b", 300, 300), ("c", 300, 600),
+    ], "abc", [_turn("A", 0, 300), _turn("B", 300, 1000)], total=1000)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": "A", "start_index": 0, "end_index": 1,
+         "text": "a", "start": 0, "end": 300},
+        {"speaker_id": "B", "start_index": 1, "end_index": 3,
+         "text": "bc", "start": 300, "end": 600},
+    ]
+
+
+def test_speaker_turns_no_overlap_is_null_block(client):
+    # 轮次只覆盖 [0,200)；好 [200,300) 与之端点相接无重叠，后续字符也无重叠
+    r = _speaker_turns(client, [
+        ("a", 0, 100), ("b", 200, 300), ("c", 400, 500),
+    ], "abc", [_turn("A", 0, 200)], total=1000)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": "A", "start_index": 0, "end_index": 1,
+         "text": "a", "start": 0, "end": 100},
+        {"speaker_id": None, "start_index": 1, "end_index": 3,
+         "text": "bc", "start": 200, "end": 500},
+    ]
+
+
+def test_speaker_turns_zero_duration_char_inside_turn(client):
+    # 零时长字符“。”[300,300] 位于轮次内部
+    r = _speaker_turns(client, [
+        ("你", 0, 100), ("好", 200, 300), ("。", 300, 300), ("呀", 400, 500),
+    ], "你好。呀", [_turn("A", 0, 400), _turn("B", 400, 1000)])
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": "A", "start_index": 0, "end_index": 3,
+         "text": "你好。", "start": 0, "end": 300},
+        {"speaker_id": "B", "start_index": 3, "end_index": 4,
+         "text": "呀", "start": 400, "end": 500},
+    ]
+
+
+def test_speaker_turns_zero_duration_char_in_gap_is_null(client):
+    # 零时长字符在两轮次的间隙 (400,500) 内 → null，与相邻同归属字符合并
+    r = _speaker_turns(client, [
+        ("a", 0, 100), ("b", 450, 450), ("c", 600, 700),
+    ], "abc", [_turn("A", 0, 400), _turn("B", 500, 1000)], total=1000)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"speaker_id": "A", "start_index": 0, "end_index": 1,
+         "text": "a", "start": 0, "end": 100},
+        {"speaker_id": None, "start_index": 1, "end_index": 2,
+         "text": "b", "start": 450, "end": 450},
+        {"speaker_id": "B", "start_index": 2, "end_index": 3,
+         "text": "c", "start": 600, "end": 700},
+    ]
+
+
+def test_speaker_turns_choose_larger_overlap_not_earlier(client):
+    # 字符 [100,500) 与 A 重叠 100、与 B 重叠 300 → 归 B（非并列不取较早）
+    r = _speaker_turns(client, [("x", 100, 500)], "x",
+                       [_turn("A", 0, 200), _turn("B", 200, 1000)],
+                       total=1000)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "speaker_id": "B", "start_index": 0, "end_index": 1,
+        "text": "x", "start": 100, "end": 500}]
+
+
+def test_speaker_turns_same_speaker_adjacent_turns_merge(client):
+    # 同一 speaker_id 的两个相接轮次，相邻归属字符合并为一块
+    r = _speaker_turns(client, [
+        ("a", 0, 100), ("b", 200, 300),
+    ], "ab",
+        [_turn("A", 0, 200), _turn("A", 200, 1000)], total=1000)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "speaker_id": "A", "start_index": 0, "end_index": 2,
+        "text": "ab", "start": 0, "end": 300}]
+
+
+def test_speaker_turns_empty_turns_all_null(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "a", [], total=200)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "speaker_id": None, "start_index": 0, "end_index": 1,
+        "text": "a", "start": 0, "end": 100}]
+
+
+def test_speaker_turns_empty_revised_text(client):
+    r = _speaker_turns(client, [("a", 0, 100)], "", [_turn("A", 0, 200)],
+                       total=200)
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_speaker_turns_zero_duration_turns_touching_allowed(client):
+    # 零时长轮次 [200,200) 与前后轮次端点相接，互不重叠 → 合法
+    r = _speaker_turns(client, [
+        ("a", 0, 100), ("b", 200, 300),
+    ], "ab",
+        [_turn("A", 0, 200), _turn("C", 200, 200), _turn("B", 200, 1000)],
+        total=1000)
+    assert r.status_code == 200, r.text
+    assert [blk["speaker_id"] for blk in r.json()] == ["A", "B"]
+
+
+def test_speaker_turns_reuses_alignment_validation(client):
+    r = _speaker_turns(client, [("a", 300, 100)], "a",
+                       [_turn("A", 0, 500)], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_speaker_turns_negative_timestamp_rejected(client):
+    r = _speaker_turns(client, [], "a", [_turn("A", -1, 100)])
+    assert r.status_code == 422
+    assert "说话人轮次" in r.json()["detail"]
+    assert "负数" in r.json()["detail"]
+
+
+def test_speaker_turns_end_before_start_rejected(client):
+    r = _speaker_turns(client, [], "a", [_turn("A", 300, 100)])
+    assert r.status_code == 422
+    assert "说话人轮次" in r.json()["detail"]
+    assert "不能早于起始时间" in r.json()["detail"]
+
+
+def test_speaker_turns_out_of_recording_range_rejected(client):
+    r = _speaker_turns(client, [], "a", [_turn("A", 0, 1001)],
+                       total=1000)
+    assert r.status_code == 422
+    assert "超出录音总时长" in r.json()["detail"]
+
+
+def test_speaker_turns_not_sorted_rejected(client):
+    r = _speaker_turns(client, [], "a",
+                       [_turn("B", 500, 600), _turn("A", 0, 100)])
+    assert r.status_code == 422
+    assert "按起始时间排序" in r.json()["detail"]
+
+
+def test_speaker_turns_overlap_rejected(client):
+    r = _speaker_turns(client, [], "a",
+                       [_turn("A", 0, 300), _turn("B", 200, 500)])
+    assert r.status_code == 422
+    assert "不得重叠" in r.json()["detail"]
+
+
+def test_speaker_turns_touching_intervals_allowed(client):
+    # [0,200) 与 [200,500) 端点相接（左闭右开）不算重叠
+    r = _speaker_turns(client, [("a", 0, 0)], "a",
+                       [_turn("A", 0, 200), _turn("B", 200, 500)], total=500)
+    assert r.status_code == 200, r.text
+    # 零时长字符时点 0 位于 A 轮次起点，归 A（边界归右侧规则下 A 即右侧）
+    assert r.json() == [{
+        "speaker_id": "A", "start_index": 0, "end_index": 1,
+        "text": "a", "start": 0, "end": 0}]
+
+
+def test_speaker_turns_empty_speaker_id_rejected(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 100, "revised_text": "a",
+        "speaker_turns": [{"speaker_id": "", "start": 0, "end": 50}]})
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_speaker_turns_missing_field_rejected(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 100, "revised_text": "a"})
+    assert r.status_code == 422
+    assert "speaker_turns" in r.json()["detail"]
+
+
+def test_speaker_turns_extra_field_rejected(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 100, "revised_text": "a",
+        "speaker_turns": [{"speaker_id": "A", "start": 0, "end": 50,
+                           "bogus": 1}]})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
+
+
+def test_speaker_turns_wrong_type_timestamp(client):
+    r = client.post("/speaker-turns", json={
+        "recognized": [], "total_duration": 100, "revised_text": "a",
+        "speaker_turns": [{"speaker_id": "A", "start": "0", "end": 50}]})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]

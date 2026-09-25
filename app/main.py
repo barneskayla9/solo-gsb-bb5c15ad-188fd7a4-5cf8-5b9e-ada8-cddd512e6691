@@ -20,10 +20,13 @@ from .schemas import (
     QuoteHit,
     RetimeRequest,
     RevisionBlock,
+    SpeakerBlock,
+    SpeakerTurnsRequest,
 )
 from .quote import find_quote_hits
 from .retime import apply_calibrations, validate_calibrations
 from .revision import build_revision_diff
+from .speaker import build_speaker_blocks, validate_speaker_turns
 from .timeline import build_timeline, validate_request
 
 
@@ -162,6 +165,20 @@ async def revision_diff(req: AlignRequest) -> list[RevisionBlock]:
     validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
     timeline = build_timeline(req, alignment.backend_name())
     return build_revision_diff(req.recognized, timeline["chars"])
+
+
+@app.post(
+    "/speaker-turns",
+    response_model=list[SpeakerBlock],
+    tags=["校时对齐"],
+)
+async def speaker_turns(req: SpeakerTurnsRequest) -> list[SpeakerBlock]:
+    """把修订文本逐字归属到说话人轮次，并合并相邻同归属字符为块。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    validate_speaker_turns(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_speaker_blocks(
+        req.revised_text, timeline["chars"], req.speaker_turns)
 
 
 @app.post(
